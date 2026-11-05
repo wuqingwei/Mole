@@ -779,9 +779,18 @@ function Invoke-MoleUninstallProcess {
 
     $runner = [powershell]::Create()
     $pending = $null
+    # A vendor uninstaller inherits our stdout unless it is redirected. In
+    # --json mode that pipe carries the result envelope, so the vendor's own
+    # progress output (NSIS details, Inno logs) would corrupt it. Redirect to
+    # a scratch file the vendor owns during its run, same shape as the SFC
+    # redirect in optimize.ps1. stderr is untouched: uninstaller error output
+    # belongs in the caller's diagnostics, and this runs headless.
+    $outputPath = $null
     try {
+        $outputPath = [System.IO.Path]::GetTempFileName()
         $null = $runner.AddCommand('Start-Process').AddParameter('FilePath', $FilePath)
         $null = $runner.AddParameter('Wait', $true).AddParameter('PassThru', $true).AddParameter('ErrorAction', 'Stop')
+        $null = $runner.AddParameter('RedirectStandardOutput', $outputPath)
         if ($ArgumentList) { $null = $runner.AddParameter('ArgumentList', $ArgumentList) }
         $pending = $runner.BeginInvoke()
         $clock = [Diagnostics.Stopwatch]::StartNew()
@@ -805,6 +814,8 @@ function Invoke-MoleUninstallProcess {
         catch { Write-Debug "Uninstaller wait cancellation failed: $_" }
         try { $runner.Dispose() }
         catch { Write-Debug "Uninstaller wait disposal failed: $_" }
+        # Our scratch file only; the vendor's own logs stay wherever it wrote them.
+        if ($outputPath) { Remove-Item -LiteralPath $outputPath -Force -ErrorAction SilentlyContinue }
     }
 }
 
