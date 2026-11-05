@@ -1612,17 +1612,15 @@ function ConvertTo-UninstallResultJson {
         if ($null -ne $record) { $record }
     }
     if ($null -eq $rows) { $rows = @() }
-    # ConvertTo-Json serializes a single-element collection as an object; the
-    # contract is an array whatever the count.
-    $rows = @($rows)
-    if ($rows.Count -eq 1) { $rows = ,$rows }
-    $missing = @()
-    if ($null -ne $NotFound) { $missing = @($NotFound) }
-
+    # ConvertTo-Json serializes a single-element collection as an object, so
+    # build the array element with an explicit subexpression: a bare $rows
+    # in the literal re-collapses to one record, and a ,$rows wrap re-nests.
     $report = [ordered]@{
-        results    = $rows
+        results    = [object[]]@($rows)
         incomplete = [bool]$Incomplete
     }
+    $missing = @()
+    if ($null -ne $NotFound) { $missing = @($NotFound) }
     if ($missing.Count -gt 0) { $report['not_found'] = $missing }
     $json = ConvertTo-Json -InputObject $report -Depth 5
     return [regex]::Replace($json, '[^\x00-\x7F]', { param($m) '\u{0:x4}' -f [int][char]$m.Value })
@@ -1747,9 +1745,11 @@ function Invoke-SelectedUninstall {
 function Main {
     # Tests and direct callers invoke Main without the script's param block;
     # give the headless-selection switches defined defaults under StrictMode.
-    if (-not (Get-Variable -Name 'Select' -Scope Local -ErrorAction SilentlyContinue)) { $Select = $null }
-    if (-not (Get-Variable -Name 'Yes' -Scope Local -ErrorAction SilentlyContinue)) { $Yes = $false }
-    if (-not (Get-Variable -Name 'Json' -Scope Local -ErrorAction SilentlyContinue)) { $Json = $false }
+    # Get-Variable without -Scope walks the scope chain, so a caller's $Select
+    # is found; a Local-scoped lookup would shadow it with $null here.
+    if (-not (Get-Variable -Name 'Select' -ErrorAction SilentlyContinue)) { $Select = $null }
+    if (-not (Get-Variable -Name 'Yes' -ErrorAction SilentlyContinue)) { $Yes = $false }
+    if (-not (Get-Variable -Name 'Json' -ErrorAction SilentlyContinue)) { $Json = $false }
 
     # Enable debug if requested
     if ($DebugMode) {
