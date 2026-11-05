@@ -36,6 +36,11 @@ $script:MoleOperationsLogFile = "$env:USERPROFILE\.config\mole\operations.log"
 $script:MoleOperationsLogMaxBytes = 5MB
 $script:MoleOperationsLogStarted = $false
 
+# Set by a command that emits structured output on stdout (clean -Json):
+# interactive rows, section headers and the spinner stay off so a caller
+# reading the pipe gets only the report. Log-file lines still accumulate.
+$script:MoleJsonOutputMode = $false
+
 function ConvertTo-MoleLogValue {
     param([string]$Value)
 
@@ -145,7 +150,7 @@ function Write-LogMessage {
     $output = "  ${colorCode}${formattedIcon}${nc}${Message}"
 
     Stop-Spinner
-    Write-Host $output
+    if (-not $script:MoleJsonOutputMode) { Write-Host $output }
     if ($script:CurrentSection.Active) { Start-Spinner }
 
     Add-MoleLogLine "$timestamp [$Level] $Message"
@@ -214,7 +219,9 @@ function Write-Debug {
         $gray = Get-MoleColor -Name "Gray"
         $nc = Get-MoleColor -Name "NC"
         Stop-Spinner
-        Write-MoleDiagnosticLine "  ${gray}[DEBUG] $Message${nc}"
+        if (-not $script:MoleJsonOutputMode) {
+            Write-MoleDiagnosticLine "  ${gray}[DEBUG] $Message${nc}"
+        }
         if ($script:CurrentSection.Active) { Start-Spinner }
         Add-MoleLogLine "$(Get-Date -Format 'HH:mm:ss') [DEBUG] $Message"
     }
@@ -251,6 +258,8 @@ function Start-Section {
     $script:CurrentSection.Activity = $false
     $script:CurrentSection.Name = $Title
 
+    if ($script:MoleJsonOutputMode) { return }
+
     $purple = Get-MoleColor -Name "PurpleBold"
     $nc = Get-MoleColor -Name "NC"
     $arrow = Get-MoleIcon -Name "Arrow"
@@ -266,7 +275,7 @@ function Stop-Section {
         End the current section
     #>
     Stop-Spinner
-    if ($script:CurrentSection.Active -and -not $script:CurrentSection.Activity) {
+    if ($script:CurrentSection.Active -and -not $script:CurrentSection.Activity -and -not $script:MoleJsonOutputMode) {
         Write-Success "Nothing to tidy"
     }
     $script:CurrentSection.Active = $false

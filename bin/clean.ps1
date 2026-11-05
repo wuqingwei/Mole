@@ -400,8 +400,11 @@ function Main {
     }
 
     # Arm the structured recorder before any cleanup module runs, so every
-    # Remove-SafeItem family call is captured for --json.
+    # Remove-SafeItem family call is captured for --json. The interactive
+    # rows (section headers, results, spinner) stay off so stdout carries
+    # only the report; the log file still accumulates.
     if ($Json) {
+        $script:MoleJsonOutputMode = $true
         $script:MoleCleanJsonRecords = New-Object System.Collections.Generic.List[object]
     }
 
