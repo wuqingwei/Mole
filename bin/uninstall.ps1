@@ -9,12 +9,24 @@ param(
 
     [Alias('d')]
     [switch]$DebugMode,
-    
+
     [Alias('r')]
     [switch]$Rescan,
 
     [switch]$List,
-    
+
+    # Uninstall by selection key (the id field of `mo uninstall --list`).
+    # One key or a comma-separated list; each entry must match exactly one
+    # app, and any unknown key fails the whole run before anything executes.
+    [string[]]$Select,
+
+    # Skip the interactive confirmation. Only honored together with --select;
+    # the interactive menu never skips it.
+    [switch]$Yes,
+
+    # Structured output for --select runs: one JSON envelope on stdout.
+    [switch]$Json,
+
     [Alias('h')]
     [switch]$ShowHelp
 )
@@ -64,6 +76,9 @@ function Show-UninstallHelp {
     Write-Host "  --dry-run    Show what would be uninstalled, change nothing"
     Write-Host "  --rescan     Force rescan of installed applications"
     Write-Host "  --list       List installed applications and exit (JSON when piped)"
+    Write-Host "  --select ID  Uninstall by selection key (the id of --list); comma-separated for several"
+    Write-Host "  --yes        Skip the confirmation prompt (only with --select)"
+    Write-Host "  --json       With --select: output the result report as JSON"
     Write-Host "  --debug      Enable debug logging"
     Write-Host "  --help       Show this help message"
     Write-Host ""
@@ -1258,24 +1273,29 @@ function Get-UninstallMethodDescription {
 
 # These public identities name apps that manage firmware charging thresholds.
 # This only explains the consequence; it never authorizes or refuses removal.
-function Show-UninstallChargeLimitNote {
+function Test-UninstallChargeLimitApp {
     param($App)
 
     $source = [string](Get-MoleProperty $App 'Source')
-    $setsLimit = $false
     if ($source -eq 'WindowsStore') {
         $identity = ([string](Get-MoleProperty $App 'PackageFullName') -split '_', 2)[0]
-        $setsLimit = $identity -in @(
+        return $identity -in @(
             'E046963F.LenovoCompanion', 'LenovoCompanyLimited.LenovoVantageService',
             'B9ECED6F.ASUSPCAssistant', 'Microsoft.SurfaceHub'
         )
     }
-    elseif ($source -eq 'Registry') {
+    if ($source -eq 'Registry') {
         $name = ([string](Get-MoleProperty $App 'Name')).Trim()
         $publisher = ([string](Get-MoleProperty $App 'Publisher')).Trim()
-        $setsLimit = $name -eq 'Lenovo Vantage Service' -and $publisher -match '^Lenovo(?:\s|$)'
+        return ($name -eq 'Lenovo Vantage Service' -and $publisher -match '^Lenovo(?:\s|$)')
     }
-    if ($setsLimit) {
+    return $false
+}
+
+function Show-UninstallChargeLimitNote {
+    param($App)
+
+    if (Test-UninstallChargeLimitApp -App $App) {
         Write-Host '    The charge limit stays after uninstall. Change it in this app first if needed.'
     }
 }
@@ -1310,35 +1330,64 @@ function Uninstall-SelectedApps {
     #>
     param([array]$Apps)
 
+    # Tests and non-JSON callers invoke this without the --json arming step;
+    # the recorder stays inert unless a list exists (same pattern as the
+    # clean command's Write-MoleCleanJsonRecord).
+    if (-not (Test-Path variable:script:MoleUninstallJsonRecords)) {
+        $script:MoleUninstallJsonRecords = New-Object System.Collections.Generic.List[object]
+    }
+
     $esc = [char]27
 
     # A dry run runs no uninstaller and removes nothing. It names the install folder
     # only when that folder could be removed after a real uninstall; Remove-SafeItem
     # only reports it in dry-run mode.
     if ($script:MoleDryRunMode) {
-        Write-Host ""
-        Write-Host "$esc[1;35mUninstall preview$esc[0m - no changes made"
-        Write-Host ""
+        if (-not $script:MoleJsonOutputMode) {
+            Write-Host ""
+            Write-Host "$esc[1;35mUninstall preview$esc[0m - no changes made"
+            Write-Host ""
+        }
         $previewCount = 0
         foreach ($app in $Apps) {
             if ($app.Source -eq "WindowsStore" -and -not (Test-MoleStoreRemovalAllowed -PackageFullName ([string](Get-MoleProperty $app 'PackageFullName')))) { continue }
             $previewCount++
-            Write-Host "$esc[34m$($script:Icons.Arrow)$esc[0m $($app.Name)"
-            Write-Host "  $esc[90mWould uninstall with $(Get-UninstallMethodDescription -App $app)$esc[0m"
-            Show-UninstallChargeLimitNote -App $app
+            if (-not $script:MoleJsonOutputMode) {
+                Write-Host "$esc[34m$($script:Icons.Arrow)$esc[0m $($app.Name)"
+                Write-Host "  $esc[90mWould uninstall with $(Get-UninstallMethodDescription -App $app)$esc[0m"
+                Show-UninstallChargeLimitNote -App $app
+            }
             $folder = [string](Get-MoleProperty $app 'InstallLocation')
             if ($app.Source -ne "WindowsStore" -and (Test-MoleLeftoverOwnership -Path $folder -App $app -Preview)) {
                 $guard = { param($candidate) Test-MoleLeftoverOwnership -Path $candidate -App $app -Preview }
                 $null = Remove-SafeItem -Path $folder -Description "Leftover files to Recycle Bin" -Recurse -Recycle -Guard $guard
             }
         }
-        Show-SummaryBlock -Heading 'Dry run complete - no changes made' -Details @("Would uninstall: $previewCount")
+        if ($script:MoleJsonOutputMode) {
+            foreach ($app in $Apps) {
+                $eligible = -not ($app.Source -eq "WindowsStore" -and -not (Test-MoleStoreRemovalAllowed -PackageFullName ([string](Get-MoleProperty $app 'PackageFullName'))))
+                $folder = [string](Get-MoleProperty $app 'InstallLocation')
+                $leftover = $eligible -and $app.Source -ne "WindowsStore" -and (Test-MoleLeftoverOwnership -Path $folder -App $app -Preview)
+                $script:MoleUninstallJsonRecords.Add([ordered]@{
+                    id      = Get-AppSelectionKey -App $app
+                    name    = [string]$app.Name
+                    outcome = $(if ($eligible) { "would_uninstall" } else { "skipped" })
+                    detail  = $(if ($eligible) { [string](Get-UninstallMethodDescription -App $app) } else { "current Store package not eligible" })
+                    leftover_to_recycle = [bool]$leftover
+                })
+            }
+        }
+        if (-not $script:MoleJsonOutputMode) {
+            Show-SummaryBlock -Heading 'Dry run complete - no changes made' -Details @("Would uninstall: $previewCount")
+        }
         return
     }
 
-    Write-Host ""
-    Write-Host "$esc[1;35mUninstalling Applications$esc[0m"
-    Write-Host ""
+    if (-not $script:MoleJsonOutputMode) {
+        Write-Host ""
+        Write-Host "$esc[1;35mUninstalling Applications$esc[0m"
+        Write-Host ""
+    }
 
     $successCount = 0
     $failCount = 0
@@ -1348,11 +1397,21 @@ function Uninstall-SelectedApps {
     foreach ($app in $Apps) {
         if ($app.Source -eq "WindowsStore" -and -not (Test-MoleStoreRemovalAllowed -PackageFullName ([string](Get-MoleProperty $app 'PackageFullName')))) {
             Write-MoleOperation -Action "SKIPPED" -Path $app.Name -Detail (Get-UninstallOperationDetail -App $app -Outcome "current Store package not eligible")
-            Write-Host "$esc[33m$($script:Icons.Arrow)$esc[0m Kept: $($app.Name) $esc[33m(current Store package not eligible)$esc[0m"
+            if (-not $script:MoleJsonOutputMode) {
+                Write-Host "$esc[33m$($script:Icons.Arrow)$esc[0m Kept: $($app.Name) $esc[33m(current Store package not eligible)$esc[0m"
+            }
+            $script:MoleUninstallJsonRecords.Add([ordered]@{
+                id = Get-AppSelectionKey -App $app
+                name = [string]$app.Name
+                outcome = "skipped"
+                detail = "current Store package not eligible"
+            })
             $remainingCount++
             continue
         }
-        Write-Host "$esc[34m$($script:Icons.Arrow)$esc[0m Uninstalling: $($app.Name)" -NoNewline
+        if (-not $script:MoleJsonOutputMode) {
+            Write-Host "$esc[34m$($script:Icons.Arrow)$esc[0m Uninstalling: $($app.Name)" -NoNewline
+        }
 
         $launch = $null
         try {
@@ -1361,7 +1420,13 @@ function Uninstall-SelectedApps {
                 if ($app.PackageFullName) {
                     Remove-AppxPackage -Package $app.PackageFullName -ErrorAction Stop
                     Write-MoleOperation -Action "UNINSTALLED" -Path $app.Name -Detail (Get-UninstallOperationDetail -App $app -Outcome "Store package removed")
-                    Write-Host " $esc[32m$($script:Icons.Success)$esc[0m"
+                    if (-not $script:MoleJsonOutputMode) { Write-Host " $esc[32m$($script:Icons.Success)$esc[0m" }
+                    $script:MoleUninstallJsonRecords.Add([ordered]@{
+                        id = Get-AppSelectionKey -App $app
+                        name = [string]$app.Name
+                        outcome = "uninstalled"
+                        detail = "Store package removed"
+                    })
                     $successCount++
                 }
                 continue
@@ -1371,7 +1436,13 @@ function Uninstall-SelectedApps {
             $launch = Get-UninstallLaunch -App $app
             if (-not $launch) {
                 Write-MoleOperation -Action "FAILED" -Path $app.Name -Detail (Get-UninstallOperationDetail -App $app -Outcome "no runnable uninstaller")
-                Write-Host " $esc[31m(no runnable uninstaller found)$esc[0m"
+                if (-not $script:MoleJsonOutputMode) { Write-Host " $esc[31m(no runnable uninstaller found)$esc[0m" }
+                $script:MoleUninstallJsonRecords.Add([ordered]@{
+                    id = Get-AppSelectionKey -App $app
+                    name = [string]$app.Name
+                    outcome = "failed"
+                    detail = "no runnable uninstaller"
+                })
                 $failCount++
                 continue
             }
@@ -1381,19 +1452,37 @@ function Uninstall-SelectedApps {
             if (Test-UninstallEntryGone -KeyPath ([string](Get-MoleProperty $app 'RegistryKey'))) {
                 if ($ranUninstaller) {
                     Write-MoleOperation -Action "UNINSTALLED" -Path $app.Name -Detail (Get-UninstallOperationDetail -App $app -Outcome "already removed, not run" -Launch $launch)
-                    Write-Host " $esc[32m$($script:Icons.Success)$esc[0m $esc[90m(already removed)$esc[0m"
+                    if (-not $script:MoleJsonOutputMode) { Write-Host " $esc[32m$($script:Icons.Success)$esc[0m $esc[90m(already removed)$esc[0m" }
+                    $script:MoleUninstallJsonRecords.Add([ordered]@{
+                        id = Get-AppSelectionKey -App $app
+                        name = [string]$app.Name
+                        outcome = "uninstalled"
+                        detail = "already removed by an earlier uninstaller"
+                    })
                     $successCount++
                 }
                 else {
                     Write-MoleOperation -Action "SKIPPED" -Path $app.Name -Detail (Get-UninstallOperationDetail -App $app -Outcome "no longer registered, not run" -Launch $launch)
-                    Write-Host " $esc[33m(no longer registered, not run)$esc[0m"
+                    if (-not $script:MoleJsonOutputMode) { Write-Host " $esc[33m(no longer registered, not run)$esc[0m" }
+                    $script:MoleUninstallJsonRecords.Add([ordered]@{
+                        id = Get-AppSelectionKey -App $app
+                        name = [string]$app.Name
+                        outcome = "skipped"
+                        detail = "no longer registered, not run"
+                    })
                     $remainingCount++
                 }
                 continue
             }
             if (-not (Test-UninstallLaunchCurrent -App $app -Launch $launch)) {
                 Write-MoleOperation -Action "FAILED" -Path $app.Name -Detail (Get-UninstallOperationDetail -App $app -Outcome "uninstall command changed since review, not run" -Launch $launch)
-                Write-Host " $esc[31m(uninstall command changed since review, not run)$esc[0m"
+                if (-not $script:MoleJsonOutputMode) { Write-Host " $esc[31m(uninstall command changed since review, not run)$esc[0m" }
+                $script:MoleUninstallJsonRecords.Add([ordered]@{
+                    id = Get-AppSelectionKey -App $app
+                    name = [string]$app.Name
+                    outcome = "failed"
+                    detail = "uninstall command changed since review, not run"
+                })
                 $failCount++
                 continue
             }
@@ -1410,34 +1499,59 @@ function Uninstall-SelectedApps {
             # then the install folder is still the app's: nothing is removed.
             if (-not (Test-UninstallEntryGone -KeyPath ([string](Get-MoleProperty $app 'RegistryKey')))) {
                 Write-MoleOperation -Action "FAILED" -Path $app.Name -Detail (Get-UninstallOperationDetail -App $app -Outcome "still installed, exit code $exitCode" -Launch $launch)
-                Write-Host " $esc[33m(still installed, exit code $exitCode)$esc[0m"
+                if (-not $script:MoleJsonOutputMode) { Write-Host " $esc[33m(still installed, exit code $exitCode)$esc[0m" }
+                $script:MoleUninstallJsonRecords.Add([ordered]@{
+                    id = Get-AppSelectionKey -App $app
+                    name = [string]$app.Name
+                    outcome = "failed"
+                    detail = "still installed, exit code $exitCode"
+                })
                 $remainingCount++
                 continue
             }
 
             Write-MoleOperation -Action "UNINSTALLED" -Path $app.Name -Detail (Get-UninstallOperationDetail -App $app -Outcome "exit code $exitCode" -Launch $launch)
-            Write-Host " $esc[32m$($script:Icons.Success)$esc[0m"
+            if (-not $script:MoleJsonOutputMode) { Write-Host " $esc[32m$($script:Icons.Success)$esc[0m" }
+            $script:MoleUninstallJsonRecords.Add([ordered]@{
+                id = Get-AppSelectionKey -App $app
+                name = [string]$app.Name
+                outcome = "uninstalled"
+                detail = "exit code $exitCode"
+            })
             $successCount++
 
             # Clean leftover files
             $folder = [string](Get-MoleProperty $app 'InstallLocation')
             if (Test-MoleLeftoverOwnership -Path $folder -App $app) {
-                Write-Host "  $esc[90mMoving leftover files to Recycle Bin...$esc[0m"
+                if (-not $script:MoleJsonOutputMode) { Write-Host "  $esc[90mMoving leftover files to Recycle Bin...$esc[0m" }
                 $guard = { param($candidate) Test-MoleLeftoverOwnership -Path $candidate -App $app }
                 $null = Remove-SafeItem -Path $folder -Description "Leftover files to Recycle Bin" -Recurse -Recycle -Guard $guard
+                $script:MoleUninstallJsonRecords[-1]['leftover_to_recycle'] = $true
             }
         }
         catch [TimeoutException] {
-            Write-Host " $esc[31m$($_.Exception.Message)$esc[0m"
+            if (-not $script:MoleJsonOutputMode) { Write-Host " $esc[31m$($_.Exception.Message)$esc[0m" }
             Write-MoleOperation -Action "FAILED" -Path $app.Name -Detail (Get-UninstallOperationDetail -App $app -Outcome $_.Exception.Message -Launch $launch)
+            $script:MoleUninstallJsonRecords.Add([ordered]@{
+                id = Get-AppSelectionKey -App $app
+                name = [string]$app.Name
+                outcome = "failed"
+                detail = [string]$_.Exception.Message
+            })
             $failCount++
             # Do not overlap the next uninstaller with the still-running vendor.
             break
         }
         catch {
-            Write-Host " $esc[31m$($script:Icons.Error)$esc[0m"
+            if (-not $script:MoleJsonOutputMode) { Write-Host " $esc[31m$($script:Icons.Error)$esc[0m" }
             Write-Debug "Uninstall failed: $_"
             Write-MoleOperation -Action "FAILED" -Path $app.Name -Detail (Get-UninstallOperationDetail -App $app -Outcome $_.Exception.Message -Launch $launch)
+            $script:MoleUninstallJsonRecords.Add([ordered]@{
+                id = Get-AppSelectionKey -App $app
+                name = [string]$app.Name
+                outcome = "failed"
+                detail = [string]$_.Exception.Message
+            })
             $failCount++
         }
     }
@@ -1446,8 +1560,10 @@ function Uninstall-SelectedApps {
     if ($remainingCount -gt 0) { $details += "Still installed: $remainingCount" }
     if ($failCount -gt 0) { $details += "Failed: $failCount" }
     $script:MoleUninstallIncomplete = ($remainingCount -gt 0 -or $failCount -gt 0)
-    $heading = if ($script:MoleUninstallIncomplete) { 'Uninstall incomplete' } else { 'Uninstall complete' }
-    Show-SummaryBlock -Heading $heading -Details $details
+    if (-not $script:MoleJsonOutputMode) {
+        $heading = if ($script:MoleUninstallIncomplete) { 'Uninstall incomplete' } else { 'Uninstall complete' }
+        Show-SummaryBlock -Heading $heading -Details $details
+    }
 
     # Clear cache
     if (Test-Path $script:AppCacheFile) {
@@ -1459,7 +1575,171 @@ function Uninstall-SelectedApps {
 # Main Entry Point
 # ============================================================================
 
+# ============================================================================
+# Selected (Headless) Uninstall
+# ============================================================================
+
+# The --select result envelope: per-app outcomes from the same execution path
+# the interactive menu runs, with the same registry rereads, Store eligibility
+# checks and charge-limit notices. Non-ASCII is \u-escaped like the other
+# engine reports so a console code page cannot change an app name.
+function ConvertTo-UninstallResultJson {
+    param(
+        [AllowNull()]
+        [object]$Records,
+
+        [Parameter(Mandatory)]
+        [bool]$Incomplete,
+
+        [AllowNull()]
+        [string[]]$NotFound
+    )
+
+    $recordList = @()
+    if ($null -ne $Records) { $recordList = [object[]]$Records }
+    $rows = foreach ($record in $recordList) {
+        if ($null -ne $record) { $record }
+    }
+    if ($null -eq $rows) { $rows = @() }
+    # ConvertTo-Json serializes a single-element collection as an object; the
+    # contract is an array whatever the count.
+    $rows = @($rows)
+    if ($rows.Count -eq 1) { $rows = ,$rows }
+    $missing = @()
+    if ($null -ne $NotFound) { $missing = @($NotFound) }
+
+    $report = [ordered]@{
+        results    = $rows
+        incomplete = [bool]$Incomplete
+    }
+    if ($missing.Count -gt 0) { $report['not_found'] = $missing }
+    $json = ConvertTo-Json -InputObject $report -Depth 5
+    return [regex]::Replace($json, '[^\x00-\x7F]', { param($m) '\u{0:x4}' -f [int][char]$m.Value })
+}
+
+# Runs `mo uninstall --select <keys> [--yes]`: resolve the requested
+# selection keys against the same inventory the menu uses, then hand the
+# matched apps to Uninstall-SelectedApps — the interactive run's execution
+# path, rereads and guards included. Any unknown key fails the whole run
+# before anything executes; without --yes the run asks the same confirmation
+# prompt as the menu.
+function Invoke-SelectedUninstall {
+    param(
+        [Parameter(Mandatory)]
+        [array]$Apps,
+
+        [Parameter(Mandatory)]
+        [string[]]$RequestedKeys,
+
+        [switch]$AssumeYes,
+        [switch]$JsonMode
+    )
+
+    # Split "a,b", trim whitespace, drop empties. A key containing a comma is
+    # impossible: registry/image paths and package full names cannot contain
+    # one in the selection key forms used here.
+    $keys = @($RequestedKeys | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+
+    $byKey = @{}
+    foreach ($app in $Apps) {
+        $key = Get-AppSelectionKey -App $app
+        if (-not $byKey.ContainsKey($key)) { $byKey[$key] = @() }
+        $byKey[$key] += $app
+    }
+
+    $selected = @()
+    $notFound = @()
+    foreach ($key in $keys) {
+        if ($byKey.ContainsKey($key)) {
+            $selected += @($byKey[$key])
+        }
+        else {
+            $notFound += $key
+        }
+    }
+
+    if ($notFound.Count -gt 0) {
+        if ($JsonMode) {
+            Write-Output (ConvertTo-UninstallResultJson -Records $null -Incomplete $true -NotFound $notFound)
+        }
+        else {
+            Write-MoleError "No installed application matches: $($notFound -join ', ')"
+            Write-Host "Run 'mo uninstall --list' for valid selection keys."
+        }
+        $script:MoleUninstallIncomplete = $true
+        return
+    }
+
+    if ($selected.Count -eq 0) {
+        if ($JsonMode) {
+            Write-Output (ConvertTo-UninstallResultJson -Records $null -Incomplete $false)
+        }
+        else {
+            Write-Info "No applications selected"
+        }
+        return
+    }
+
+    if ($JsonMode) {
+        $script:MoleUninstallJsonRecords = New-Object System.Collections.Generic.List[object]
+    }
+
+    if (-not $JsonMode) {
+        $esc = [char]27
+        Clear-MoleScreen
+        Write-Host ""
+        if ($script:MoleDryRunMode) {
+            Write-Host "$esc[33mDry run: the following applications would be uninstalled:$esc[0m"
+        }
+        else {
+            Write-Host "$esc[33mThe following applications will be uninstalled:$esc[0m"
+        }
+        Write-Host ""
+        foreach ($app in $selected) {
+            Write-Host "  $($script:Icons.List) $($app.Name) ($($app.SizeHuman))"
+            Show-UninstallChargeLimitNote -App $app
+        }
+        Write-Host ""
+    }
+    elseif ($script:MoleDryRunMode -eq $false) {
+        # JSON execute mode still surfaces the charge-limit notices on stderr:
+        # the reporter must be able to pass them through; they change nothing.
+        foreach ($app in $selected) {
+            if (Test-UninstallChargeLimitApp -App $app) {
+                Write-MoleDiagnosticLine "NOTICE: The charge limit stays after uninstall. Change it in this app first if needed."
+            }
+        }
+    }
+
+    $confirmed = $AssumeYes -or $script:MoleDryRunMode
+    if (-not $confirmed) {
+        $confirm = Read-Host "Continue? (y/N)"
+        $confirmed = ($confirm -eq 'y' -or $confirm -eq 'Y')
+    }
+
+    if ($confirmed) {
+        Uninstall-SelectedApps -Apps $selected
+        if ($JsonMode) {
+            Write-Output (ConvertTo-UninstallResultJson -Records $script:MoleUninstallJsonRecords -Incomplete $script:MoleUninstallIncomplete)
+        }
+    }
+    else {
+        if (-not $JsonMode) { Write-Info "Cancelled" }
+        else {
+            Write-Output (ConvertTo-UninstallResultJson -Records $null -Incomplete $true)
+        }
+        # A declined run changed nothing; that is not an incomplete uninstall.
+        $script:MoleUninstallIncomplete = $false
+    }
+}
+
 function Main {
+    # Tests and direct callers invoke Main without the script's param block;
+    # give the headless-selection switches defined defaults under StrictMode.
+    if (-not (Get-Variable -Name 'Select' -Scope Local -ErrorAction SilentlyContinue)) { $Select = $null }
+    if (-not (Get-Variable -Name 'Yes' -Scope Local -ErrorAction SilentlyContinue)) { $Yes = $false }
+    if (-not (Get-Variable -Name 'Json' -Scope Local -ErrorAction SilentlyContinue)) { $Json = $false }
+
     # Enable debug if requested
     if ($DebugMode) {
         Enable-DebugMode
@@ -1481,6 +1761,24 @@ function Main {
     if ($DryRun) {
         $env:MOLE_DRY_RUN = "1"
         Set-DryRunMode -Enabled $true
+    }
+
+    # Headless selection runs no menu and keeps stdout clean for --json.
+    if ($Select) {
+        if ($Json) { $script:MoleJsonOutputMode = $true }
+        $apps = @(Get-InstalledApplications -ForceRescan:$Rescan)
+        if ($apps.Count -eq 0) {
+            if ($Json) {
+                Write-Output (ConvertTo-UninstallResultJson -Records $null -Incomplete $true)
+            }
+            else {
+                Write-MoleWarning "No applications found"
+            }
+            $script:MoleUninstallIncomplete = $true
+            return
+        }
+        Invoke-SelectedUninstall -Apps $apps -RequestedKeys $Select -AssumeYes:$Yes -JsonMode:$Json
+        return
     }
 
     # Clear screen
