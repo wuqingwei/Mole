@@ -1498,3 +1498,141 @@ Describe 'Charge limit uninstall notice' {
         Should -Invoke Remove-AppxPackage -Times 0 -Exactly
     }
 }
+
+Describe "mo uninstall --select" {
+    BeforeAll {
+        $script:App1 = [PSCustomObject]@{
+            Name = "First app"; Source = "Registry"; SizeHuman = "1MB"; SizeKB = 1024
+            RegistryKey = "Microsoft.PowerShell.Core\Registry::HKEY_LOCAL_MACHINE\SOFTWARE\FirstApp"
+            InstallLocation = "C:\Program Files\FirstApp"; PackageFullName = $null; Publisher = ""
+        }
+        $script:App2 = [PSCustomObject]@{
+            Name = "Second app"; Source = "Registry"; SizeHuman = "2MB"; SizeKB = 2048
+            RegistryKey = "Microsoft.PowerShell.Core\Registry::HKEY_LOCAL_MACHINE\SOFTWARE\SecondApp"
+            InstallLocation = "C:\Program Files\SecondApp"; PackageFullName = $null; Publisher = ""
+        }
+        $script:SelectApps = @($script:App1, $script:App2)
+        $script:FirstKey = Get-AppSelectionKey -App $script:App1
+        $script:SecondKey = Get-AppSelectionKey -App $script:App2
+    }
+
+    BeforeEach {
+        $script:MoleUninstallIncomplete = $false
+        $script:MoleUninstallJsonRecords = $null
+        $script:MoleDryRunMode = $false
+        Mock Clear-MoleScreen {}
+        Mock Write-Host {}
+        Mock Write-Info {}
+        Mock Write-MoleWarning {}
+        Mock Write-MoleError {}
+        Mock Read-Host { "n" }
+        Mock Uninstall-SelectedApps {}
+        Mock Get-InstalledApplications { $script:SelectApps }
+    }
+
+    It "Runs no uninstaller and marks incomplete when a key matches nothing" {
+        $key = Get-AppSelectionKey -App $script:App1
+        $script:Select = @($key, "registry:HKEY_LOCAL_MACHINE\SOFTWARE\Ghost App")
+        $script:Yes = $true
+        $script:Json = $false
+
+        Invoke-SelectedUninstall -Apps $script:SelectApps -RequestedKeys $script:Select -AssumeYes:$script:Yes -JsonMode:$script:Json
+
+        Should -Invoke Uninstall-SelectedApps -Times 0 -Exactly
+        Should -Invoke Read-Host -Times 0 -Exactly
+        $script:MoleUninstallIncomplete | Should -BeTrue
+    }
+
+    It "Asks for confirmation and declines without --yes" {
+        $script:Select = @($script:FirstKey)
+        $script:Yes = $false
+        $script:Json = $false
+
+        Invoke-SelectedUninstall -Apps $script:SelectApps -RequestedKeys $script:Select -AssumeYes:$script:Yes -JsonMode:$script:Json
+
+        Should -Invoke Read-Host -Times 1 -Exactly
+        Should -Invoke Uninstall-SelectedApps -Times 0 -Exactly
+        # A declined run changed nothing; that is not incomplete.
+        $script:MoleUninstallIncomplete | Should -BeFalse
+    }
+
+    It "Skips the prompt with --yes and runs the same execution path" {
+        $script:Select = @($script:FirstKey, $script:SecondKey)
+        $script:Yes = $true
+        $script:Json = $false
+
+        Invoke-SelectedUninstall -Apps $script:SelectApps -RequestedKeys $script:Select -AssumeYes:$script:Yes -JsonMode:$script:Json
+
+        Should -Invoke Read-Host -Times 0 -Exactly
+        Should -Invoke Uninstall-SelectedApps -Times 1 -Exactly -ParameterFilter {
+            $Apps.Count -eq 2 -and $Apps[0].Name -eq "First app" -and $Apps[1].Name -eq "Second app"
+        }
+    }
+
+    It "Splits comma-separated keys and matches each exactly" {
+        $script:Select = @("$script:FirstKey,$script:SecondKey")
+        $script:Yes = $true
+        $script:Json = $false
+
+        Invoke-SelectedUninstall -Apps $script:SelectApps -RequestedKeys $script:Select -AssumeYes:$script:Yes -JsonMode:$script:Json
+
+        Should -Invoke Uninstall-SelectedApps -Times 1 -Exactly -ParameterFilter { $Apps.Count -eq 2 }
+    }
+
+    It "Emits a JSON envelope with outcomes and respects mode vocabulary" {
+        $script:Select = @($script:FirstKey)
+        $script:Yes = $true
+        $script:Json = $true
+        $script:MoleJsonOutputMode = $true
+
+        Mock Uninstall-SelectedApps {
+            param([array]$Apps)
+            foreach ($app in $Apps) {
+                $script:MoleUninstallJsonRecords.Add([ordered]@{
+                    id = Get-AppSelectionKey -App $app
+                    name = [string]$app.Name
+                    outcome = "uninstalled"
+                    detail = "exit code 0"
+                })
+            }
+            $script:MoleUninstallIncomplete = $false
+        }
+
+        $output = Invoke-SelectedUninstall -Apps $script:SelectApps -RequestedKeys $script:Select -AssumeYes:$script:Yes -JsonMode:$script:Json
+        $script:MoleJsonOutputMode = $false
+
+        $output | Should -Not -BeNullOrEmpty
+        $output | Should -Not -Match '[^\x00-\x7F]'
+        $report = $output | ConvertFrom-Json
+        @($report.results).Count | Should -Be 1
+        $report.results[0].outcome | Should -Be "uninstalled"
+        $report.results[0].id | Should -Be $script:FirstKey
+        $report.incomplete | Should -BeFalse
+    }
+
+    It "Reports not_found keys in the JSON envelope" {
+        $script:Select = @("registry:HKEY_LOCAL_MACHINE\SOFTWARE\Ghost App")
+        $script:Yes = $true
+        $script:Json = $true
+
+        $output = Invoke-SelectedUninstall -Apps $script:SelectApps -RequestedKeys $script:Select -AssumeYes:$script:Yes -JsonMode:$script:Json
+
+        $report = $output | ConvertFrom-Json
+        $report.incomplete | Should -BeTrue
+        @($report.not_found).Count | Should -Be 1
+        $report.not_found[0] | Should -Match "Ghost App"
+    }
+
+    It "Dry-run mode confirms without --yes and runs no uninstaller" {
+        $script:Select = @($script:FirstKey)
+        $script:Yes = $false
+        $script:Json = $false
+        $script:MoleDryRunMode = $true
+
+        Invoke-SelectedUninstall -Apps $script:SelectApps -RequestedKeys $script:Select -AssumeYes:$script:Yes -JsonMode:$script:Json
+        $script:MoleDryRunMode = $false
+
+        Should -Invoke Read-Host -Times 0 -Exactly
+        Should -Invoke Uninstall-SelectedApps -Times 1 -Exactly
+    }
+}
