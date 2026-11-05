@@ -609,6 +609,7 @@ function Remove-SafeItem {
             if (-not $script:MoleDryRunMode) {
                 Write-MoleOperation -Action "SKIPPED" -Path $Path -Detail "refused: $($validatedTree['Reason'])"
             }
+            Write-MoleCleanJsonRecord -Action "skipped" -Path $Path -Description $Description -Reason "refused: $($validatedTree['Reason'])"
             return $false
         }
     }
@@ -638,6 +639,7 @@ function Remove-SafeItem {
         $name = if ($Description) { $Description } else { Split-Path -Leaf $Path }
         Write-DryRun "$name $($script:Colors.Yellow)($sizeHuman dry)$($script:Colors.NC)"
         Add-DryRunListEntries -Description $name -Paths @($Path)
+        Write-MoleCleanJsonRecord -Action $(if ($Recycle) { "would_recycle" } else { "would_remove" }) -Path $Path -SizeBytes $size -Description $name
         Set-SectionActivity
         return $true
     }
@@ -667,13 +669,15 @@ function Remove-SafeItem {
         # Log success
         $name = if ($Description) { $Description } else { Split-Path -Leaf $Path }
         Write-Success "$name $($script:Colors.Green)($sizeHuman)$($script:Colors.NC)"
+        Write-MoleCleanJsonRecord -Action $(if ($Recycle) { "recycled" } else { "removed" }) -Path $Path -SizeBytes $size -Description $name
         Set-SectionActivity
-        
+
         return $true
     }
     catch {
         Write-Debug "Failed to remove $Path : $_"
         Write-MoleOperation -Action "FAILED" -Path $Path -Detail $_.Exception.Message
+        Write-MoleCleanJsonRecord -Action "failed" -Path $Path -Description $(if ($Description) { $Description } else { Split-Path -Leaf $Path }) -Reason $_.Exception.Message
         if ($Recycle) { Write-Warning "Could not recycle $Path. Review the remaining files manually." }
         return $false
     }
@@ -713,7 +717,7 @@ function Remove-SafeItems {
         $pathSnapshot = Get-MolePathSnapshot -Path $path -AllowLeafLink
         if (-not $pathSnapshot) { continue }
         $isDirectory = Test-Path -LiteralPath $path -PathType Container
-        $validatedTree = $null
+            $validatedTree = $null
         if ($isDirectory) {
             $validatedTree = Get-SafeDirectoryTreeItems -Path $path -WhitelistState $whitelistState
             if (-not $validatedTree.Success) {
@@ -721,6 +725,7 @@ function Remove-SafeItems {
                 if (-not $script:MoleDryRunMode) {
                     Write-MoleOperation -Action "SKIPPED" -Path $path -Detail "refused: $($validatedTree['Reason'])"
                 }
+                Write-MoleCleanJsonRecord -Action "skipped" -Path $path -Description $Description -Reason "refused: $($validatedTree['Reason'])"
                 continue
             }
         }
@@ -736,6 +741,7 @@ function Remove-SafeItems {
             $totalSize += $size
             $removedCount++
             $dryRunPaths.Add($path)
+            Write-MoleCleanJsonRecord -Action "would_remove" -Path $path -SizeBytes $size -Description $Description
             continue
         }
         
@@ -745,10 +751,12 @@ function Remove-SafeItems {
                 if (-not (Remove-SafeDirectoryTree -Path $path -ValidatedTree $validatedTree -Report $treeReport -WhitelistState $whitelistState -CanRemove $CanRemove)) {
                     if ($treeReport['OwnerHeld']) {
                         Write-MoleOperation -Action "SKIPPED" -Path $path -Detail $treeReport.Reason
+                        Write-MoleCleanJsonRecord -Action "skipped" -Path $path -Description $Description -Reason $treeReport.Reason
                         continue
                     }
                     $failedCount++
                     Write-MoleOperation -Action "FAILED" -Path $path -Detail (Format-MoleTreeRemovalDetail $treeReport)
+                    Write-MoleCleanJsonRecord -Action "failed" -Path $path -Description $Description -Reason (Format-MoleTreeRemovalDetail $treeReport)
                     continue
                 }
             }
@@ -756,6 +764,7 @@ function Remove-SafeItems {
                 Remove-Item -LiteralPath $path -Force -ErrorAction Stop
             }
             Write-MoleOperation -Action "REMOVED" -Path $path -Detail (Format-ByteSize -Bytes $size)
+            Write-MoleCleanJsonRecord -Action "removed" -Path $path -SizeBytes $size -Description $Description
             $totalSize += $size
             $removedCount++
         }
@@ -763,6 +772,7 @@ function Remove-SafeItems {
             $failedCount++
             Write-Debug "Failed to remove: $path - $_"
             Write-MoleOperation -Action "FAILED" -Path $path -Detail $_.Exception.Message
+            Write-MoleCleanJsonRecord -Action "failed" -Path $path -Description $Description -Reason $_.Exception.Message
         }
     }
     
@@ -808,6 +818,39 @@ function Add-DryRunListEntries {
     }
     $lines = @("# $Description") + $Paths + @("")
     Add-Content -Path $script:ExportListFile -Value $lines -ErrorAction SilentlyContinue
+}
+
+# Structured records for `mo clean --json`. Only clean.ps1 -Json arms the
+# recorder by creating $script:MoleCleanJsonRecords; every other command, and
+# a plain clean run, write nothing here, exactly like Add-DryRunListEntries
+# keys off the export list. Records are taken at the same points that update
+# the counters the text summary prints, so a preview and a real run report
+# the same paths and sizes.
+function Write-MoleCleanJsonRecord {
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('would_remove', 'would_recycle', 'removed', 'recycled', 'skipped', 'failed')]
+        [string]$Action,
+
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [long]$SizeBytes = 0,
+
+        [string]$Description = "",
+
+        [string]$Reason = ""
+    )
+
+    if (-not (Test-Path variable:script:MoleCleanJsonRecords)) { return }
+    $record = [ordered]@{
+        description = $Description
+        path        = $Path
+        size_bytes  = $SizeBytes
+        action      = $Action
+    }
+    if ($Reason) { $record['reason'] = $Reason }
+    $script:MoleCleanJsonRecords.Add($record)
 }
 
 # ============================================================================

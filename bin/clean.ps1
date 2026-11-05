@@ -6,7 +6,9 @@
 param(
     [Alias('dry-run')]
     [switch]$DryRun,
-    
+
+    [switch]$Json,
+
     [Alias('s')]
     [switch]$System,
     
@@ -68,6 +70,7 @@ function Show-CleanHelp {
     Write-Host ""
     Write-Host "$esc[33mOptions:$esc[0m"
     Write-Host "  --dry-run      Preview changes without deleting (recommended first run)"
+    Write-Host "  --json         Output the cleanup report as JSON instead of the interactive summary"
     Write-Host "  --system       Include system-level cleanup (requires admin)"
     Write-Host "  --game-media   Clean old game replays, screenshots, recordings (>90d)"
     Write-Host "  --gpu-shaders  Clean GPU shader caches (games recompile them on next launch)"
@@ -157,6 +160,72 @@ function Show-CleanupSummary {
 }
 
 # ============================================================================
+# JSON Report
+# ============================================================================
+
+# The --json envelope: one object, records from the Remove-SafeItem family,
+# totals from the same counters the text summary prints. Records are captured
+# at the exact points that update those counters, so a preview (dry run) and
+# a real run report the same paths and sizes for unchanged state. Owner-cache
+# commands and system-only sinks (Delivery Optimization) appear in totals
+# only; their per-item detail stays in the operations log `mo history` reads.
+function ConvertTo-MoleCleanJsonReport {
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('preview', 'execute')]
+        [string]$Mode,
+
+        [Parameter(Mandatory)]
+        [hashtable]$Scope,
+
+        [AllowNull()]
+        [object]$Records,
+
+        [Parameter(Mandatory)]
+        [hashtable]$Stats,
+
+        [string]$RunError = ""
+    )
+
+    $recordList = @()
+    if ($null -ne $Records) { $recordList = [object[]]$Records }
+
+    $rows = foreach ($record in $recordList) {
+        if ($null -ne $record) {
+            $row = [ordered]@{
+                description = [string]$record['description']
+                path        = [string]$record['path']
+                size_bytes  = [long]$record['size_bytes']
+                action      = [string]$record['action']
+            }
+            if ($record['reason']) { $row['reason'] = [string]$record['reason'] }
+            $row
+        }
+    }
+    if ($null -eq $rows) { $rows = @() }
+    $report = [ordered]@{
+        mode    = $Mode
+        scope   = [ordered]@{
+            system      = [bool]$Scope['System']
+            game_media  = [bool]$Scope['GameMedia']
+            gpu_shaders = [bool]$Scope['GpuShaders']
+        }
+        records = $rows
+        totals  = [ordered]@{
+            size_bytes     = [long]$Stats['TotalSizeKB'] * 1024
+            items          = [int]$Stats['FilesCleaned']
+            groups         = [int]$Stats['TotalItems']
+            owner_cleanups = [int]$Stats['OwnerCleanups']
+        }
+    }
+    if ($RunError) { $report['error'] = $RunError }
+    $json = ConvertTo-Json -InputObject $report -Depth 5
+    # Non-ASCII is written as \u escapes so a console code page cannot change
+    # a path on the way out (same rule as ConvertTo-UninstallListJson).
+    return [regex]::Replace($json, '[^\x00-\x7F]', { param($m) '\u{0:x4}' -f [int][char]$m.Value })
+}
+
+# ============================================================================
 # Main Cleanup Flow
 # ============================================================================
 
@@ -165,21 +234,26 @@ function Start-Cleanup {
         [bool]$IsDryRun,
         [bool]$IncludeSystem,
         [bool]$IncludeGameMedia,
-        [bool]$IncludeGpuShaders
+        [bool]$IncludeGpuShaders,
+        [switch]$JsonMode
     )
 
     $esc = [char]27
 
     # Clear screen
-    Clear-MoleScreen
-    Write-Host ""
-    Write-Host "$esc[1;35mClean Your Windows$esc[0m"
-    Write-Host ""
+    if (-not $JsonMode) {
+        Clear-MoleScreen
+        Write-Host ""
+        Write-Host "$esc[1;35mClean Your Windows$esc[0m"
+        Write-Host ""
+    }
 
     # Show mode
     if ($IsDryRun) {
-        Write-Host "$esc[33mDry Run Mode$esc[0m - Preview only, no deletions"
-        Write-Host ""
+        if (-not $JsonMode) {
+            Write-Host "$esc[33mDry Run Mode$esc[0m - Preview only, no deletions"
+            Write-Host ""
+        }
 
         # Prepare export file
         $exportDir = Split-Path -Parent $script:ExportListFile
@@ -198,7 +272,7 @@ function Start-Cleanup {
 "@
         Set-Content -Path $script:ExportListFile -Value $header
     }
-    else {
+    elseif (-not $JsonMode) {
         Write-Host "$esc[90m$($script:Icons.Solid) Use --dry-run to preview, --whitelist to manage protected paths$esc[0m"
         Write-Host ""
     }
@@ -206,26 +280,31 @@ function Start-Cleanup {
     # System cleanup confirmation
     if ($IncludeSystem -and -not $IsDryRun) {
         if (-not (Test-IsAdmin)) {
-            Write-MoleWarning "System cleanup requires administrator privileges"
-            Write-Host "  Run PowerShell as Administrator for full cleanup"
-            Write-Host ""
+            if (-not $JsonMode) {
+                Write-MoleWarning "System cleanup requires administrator privileges"
+                Write-Host "  Run PowerShell as Administrator for full cleanup"
+                Write-Host ""
+            }
             $IncludeSystem = $false
         }
-        else {
+        elseif (-not $JsonMode) {
             Write-Host "$esc[32m$($script:Icons.Success)$esc[0m Running with Administrator privileges"
             Write-Host ""
         }
     }
 
     # Show system info
-    $winVer = Get-WindowsVersion
-    Write-Host "$esc[34m$($script:Icons.Admin)$esc[0m $($winVer.Name) | Free space: $(Get-FreeSpace)"
+    if (-not $JsonMode) {
+        $winVer = Get-WindowsVersion
+        Write-Host "$esc[34m$($script:Icons.Admin)$esc[0m $($winVer.Name) | Free space: $(Get-FreeSpace)"
+    }
 
     # Reset stats
     Reset-CleanupStats
     Set-DryRunMode -Enabled $IsDryRun
 
     # Run cleanup modules
+    $runError = $null
     try {
         # User essentials (temp, logs, etc.)
         Invoke-UserCleanup -TempDaysOld 7 -LogDaysOld 7
@@ -259,6 +338,7 @@ function Start-Cleanup {
         }
     }
     catch {
+        $runError = "$_"
         Write-MoleError "Cleanup error: $_"
     }
     finally {
@@ -268,6 +348,20 @@ function Start-Cleanup {
 
     # Get final stats
     $stats = Get-CleanupStats
+
+    if ($JsonMode) {
+        # The effective scope: --system downgrades to $false without admin,
+        # and the report must say what actually ran.
+        return @{
+            Stats = $stats
+            Scope = @{
+                System      = [bool]$IncludeSystem
+                GameMedia   = [bool]$IncludeGameMedia
+                GpuShaders  = [bool]$IncludeGpuShaders
+            }
+            Error = $runError
+        }
+    }
 
     # Show summary
     Show-CleanupSummary -Stats $stats -IsDryRun $IsDryRun
@@ -305,8 +399,19 @@ function Main {
         $env:MOLE_DRY_RUN = "0"
     }
 
+    # Arm the structured recorder before any cleanup module runs, so every
+    # Remove-SafeItem family call is captured for --json.
+    if ($Json) {
+        $script:MoleCleanJsonRecords = New-Object System.Collections.Generic.List[object]
+    }
+
     # Run cleanup
-    Start-Cleanup -IsDryRun $effectiveDryRun -IncludeSystem $System -IncludeGameMedia $GameMedia -IncludeGpuShaders $GpuShaders
+    $result = Start-Cleanup -IsDryRun $effectiveDryRun -IncludeSystem $System -IncludeGameMedia $GameMedia -IncludeGpuShaders $GpuShaders -JsonMode:$Json
+
+    if ($Json) {
+        $mode = if ($effectiveDryRun) { 'preview' } else { 'execute' }
+        Write-Output (ConvertTo-MoleCleanJsonReport -Mode $mode -Scope $result.Scope -Records $script:MoleCleanJsonRecords -Stats $result.Stats -RunError $result.Error)
+    }
 }
 
 # Run main
