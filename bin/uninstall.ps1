@@ -884,7 +884,7 @@ function Get-InstalledApplications {
     }
 
     # --list output may be redirected: Write-Host and progress would reach it.
-    if (-not $Quiet) { Write-Info "Scanning installed applications..." }
+    if (-not $Quiet -and -not $script:MoleJsonOutputMode) { Write-Info "Scanning installed applications..." }
 
     $apps = @()
 
@@ -1762,10 +1762,12 @@ function Main {
         Set-DryRunMode -Enabled $true
     }
 
-    # Headless selection runs no menu and keeps stdout clean for --json.
+    # Headless selection runs no menu and keeps stdout clean for --json: the
+    # inventory scan runs Quiet even without --json, where a redirected
+    # caller would otherwise get the "Scanning..." line ahead of the menu.
     if ($Select) {
         if ($Json) { $script:MoleJsonOutputMode = $true }
-        $apps = @(Get-InstalledApplications -ForceRescan:$Rescan)
+        $apps = @(Get-InstalledApplications -ForceRescan:$Rescan -Quiet)
         if ($apps.Count -eq 0) {
             if ($Json) {
                 Write-Output (ConvertTo-UninstallResultJson -Records $null -Incomplete $true)
